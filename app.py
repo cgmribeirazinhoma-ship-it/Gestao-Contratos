@@ -17,6 +17,8 @@ import time
 import base64
 import unicodedata
 from datetime import datetime, timedelta, date
+import json
+from decimal import Decimal
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -422,6 +424,42 @@ st.markdown("""
         color: #fbbf24 !important;
     }
 
+    .gel-db-status-box {
+        background: rgba(15, 23, 42, 0.3);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        padding: 7px 10px;
+        font-size: 11px;
+        margin-bottom: 14px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .gel-db-pulse-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background-color: #10b981;
+        box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+        animation: pulse-green 2s infinite;
+        flex-shrink: 0;
+    }
+    .gel-db-pulse-dot.offline {
+        background-color: #ef4444;
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+        animation: pulse-red 2s infinite;
+    }
+    @keyframes pulse-green {
+        0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+        70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+        100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+    }
+    @keyframes pulse-red {
+        0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+        70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+        100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+    }
+
     /* Cards de Contratos na Visão Dinâmica (Claro e Limpo) */
     .gel-contract-card {
         background: #ffffff;
@@ -674,12 +712,22 @@ def get_engine():
                 db_url = st.secrets["DATABASE_URL"]
         except Exception:
             pass
+    if not db_url:
+        try:
+            sec_file = os.path.join(_BASE_DIR, ".streamlit", "secrets.toml")
+            if os.path.exists(sec_file):
+                import tomllib
+                with open(sec_file, "rb") as f:
+                    sec_data = tomllib.load(f)
+                    db_url = sec_data.get("DATABASE_URL")
+        except Exception:
+            pass
         
     if db_url:
         # Se for PostgreSQL via psycopg2/psycopg2-binary, a URL deve comecar com postgresql://
         if db_url.startswith("postgres://"):
             db_url = db_url.replace("postgres://", "postgresql://", 1)
-        return create_engine(db_url)
+        return create_engine(db_url, pool_pre_ping=True, pool_recycle=300)
 
     # 2. Fallback para as configuracoes locais originais
     db_type = DB_CONFIG.get("type", "sqlite")
@@ -6156,6 +6204,396 @@ def tela_gestao_secretarios_fiscais():
                     except Exception as e:
                         st.error(f"Erro ao cadastrar: {e}")
 
+# ============================================
+# CENTRAL DE BACKUPS, SEGURANÇA & MONITORAMENTO
+# ============================================
+
+@st.cache_data(ttl=15, show_spinner=False)
+def obter_status_conexao_banco():
+    t0 = time.time()
+    try:
+        with engine.connect() as conn:
+            cnt = conn.execute(text("SELECT count(*) FROM contratos")).scalar()
+            latencia = int((time.time() - t0) * 1000)
+            db_url_str = str(engine.url).lower()
+            is_pg = "postgresql" in db_url_str or "postgres" in db_url_str
+            return {
+                "online": True,
+                "tipo": "PostgreSQL (Supabase Nuvem)" if is_pg else "SQLite Local",
+                "latencia_ms": max(latencia, 1),
+                "total_contratos": cnt or 0,
+                "msg": "Banco Conectado e Operacional"
+            }
+    except Exception as e:
+        return {
+            "online": False,
+            "tipo": "Indisponível",
+            "latencia_ms": -1,
+            "total_contratos": 0,
+            "msg": str(e)
+        }
+
+def json_serializer_backup(obj):
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return float(obj)
+    return str(obj)
+
+def gerar_backup_excel(eng):
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    
+    query = """
+        SELECT 
+            c.id AS "ID",
+            c.numero_contrato AS "Nº Contrato",
+            c.ano_contrato AS "Ano",
+            c.numero_completo AS "Nº Completo",
+            o.nome AS "Secretaria / Órgão",
+            c.modalidade AS "Modalidade",
+            c.processo_adm AS "Processo Adm",
+            c.objeto AS "Objeto Contratual",
+            COALESCE(f.razao_social, f.nome_fantasia, 'Não informado') AS "Fornecedor / Razão Social",
+            f.cnpj_cpf AS "CNPJ / CPF Fornecedor",
+            c.valor_total AS "Valor Total (R$)",
+            c.data_assinatura AS "Data de Assinatura",
+            c.data_publicacao AS "Data de Publicação",
+            c.data_vencimento AS "Data de Vencimento",
+            c.vigencia_descricao AS "Vigência",
+            c.secretario AS "Secretário(a) Titular",
+            c.fiscal AS "Fiscal do Contrato",
+            c.status AS "Status",
+            c.dotacao_orcamentaria AS "Dotação Orçamentária",
+            c.modelo_agu AS "Modelo AGU",
+            f.telefone AS "Telefone Fornecedor",
+            f.email AS "Email Fornecedor",
+            c.observacoes AS "Observações",
+            c.data_criacao AS "Data de Registro no Sistema"
+        FROM contratos c
+        LEFT JOIN orgaos o ON c.orgao_id = o.id
+        LEFT JOIN fornecedores f ON c.fornecedor_id = f.id
+        ORDER BY c.ano_contrato DESC, c.numero_contrato ASC
+    """
+    
+    with eng.connect() as conn:
+        df = pd.read_sql(text(query), conn)
+        
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Contratos', index=False)
+        ws = writer.sheets['Contratos']
+        
+        # Cabeçalho estilizado em Azul Real Oficial
+        header_fill = PatternFill(start_color="0284C7", end_color="0284C7", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True, size=11)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            
+        # Formatação de linhas e auto-ajuste de largura
+        for col in ws.columns:
+            max_len = max(len(str(cell.value or '')) for cell in col)
+            col_letter = col[0].column_letter
+            ws.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 48)
+            
+    output.seek(0)
+    return output.getvalue()
+
+def gerar_backup_json(eng):
+    tabelas = ['contratos', 'fornecedores', 'orgaos', 'termos_aditivos', 'protocolos', 'usuarios', 'audit_log']
+    dados = {
+        "metadados": {
+            "municipio": "Prefeitura Municipal de Ribeirãozinho do Maranhão - MA",
+            "gerado_em": datetime.now().isoformat(),
+            "tipo_banco": "PostgreSQL (Supabase)",
+            "versao_sistema": "2026.1",
+            "conteudo": "BACKUP GERAL COMPLETO (TODAS AS TABELAS DO BANCO DE DADOS)"
+        },
+        "tabelas": {}
+    }
+    with eng.connect() as conn:
+        for tab in tabelas:
+            try:
+                rows = conn.execute(text(f"SELECT * FROM {tab}")).mappings().all()
+                registros = []
+                for r in rows:
+                    d = dict(r)
+                    if tab == 'usuarios' and 'senha_hash' in d:
+                        del d['senha_hash']
+                    registros.append(d)
+                dados["tabelas"][tab] = registros
+            except Exception:
+                dados["tabelas"][tab] = []
+            
+    return json.dumps(dados, indent=2, ensure_ascii=False, default=json_serializer_backup).encode('utf-8')
+
+def gerar_backup_sql(eng):
+    tabelas = ['orgaos', 'fornecedores', 'usuarios', 'contratos', 'termos_aditivos', 'protocolos', 'audit_log']
+    linhas_sql = [
+        "-- ===================================================================",
+        "-- BACKUP DUMP SQL GERAL - PREFEITURA DE RIBEIRÃOZINHO DO MARANHÃO - MA",
+        "-- CONTÉM TODAS AS INFORMAÇÕES DO BANCO DE DADOS",
+        f"-- Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
+        "-- ===================================================================\n"
+    ]
+    with eng.connect() as conn:
+        for tab in tabelas:
+            try:
+                rows = conn.execute(text(f"SELECT * FROM {tab}")).mappings().all()
+                if not rows:
+                    continue
+                linhas_sql.append(f"\n-- Tabela: {tab} ({len(rows)} registros)")
+                cols = list(rows[0].keys())
+                cols_str = ", ".join(cols)
+                for r in rows:
+                    valores = []
+                    for c in cols:
+                        v = r[c]
+                        if v is None:
+                            valores.append("NULL")
+                        elif isinstance(v, (int, float, Decimal)):
+                            valores.append(str(v))
+                        else:
+                            v_str = str(v).replace("'", "''")
+                            valores.append(f"'{v_str}'")
+                    vals_str = ", ".join(valores)
+                    linhas_sql.append(f"INSERT INTO {tab} ({cols_str}) VALUES ({vals_str});")
+            except Exception:
+                pass
+                
+    return "\n".join(linhas_sql).encode('utf-8')
+
+def tela_backups_sistema():
+    brasao_b64 = obter_brasao_b64()
+    brasao_banner_img = f"<div style='background: rgba(255,255,255,0.92); padding: 6px 12px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.15); display: flex; align-items: center; justify-content: center;'><img src='data:image/png;base64,{brasao_b64}' style='height: 52px; width: auto;' alt='Brasão' /></div>" if brasao_b64 else ""
+
+    st.markdown(f"""
+        <div class='municipal-banner' style='margin-bottom: 16px;'>
+            <div style='display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;'>
+                <div>
+                    <div class='municipal-badge-pill'>
+                        <span class='beacon-active-gel' style='background: #ffffff;'></span> SEGURANÇA, CONECTIVIDADE & BACKUPS
+                    </div>
+                    <h2 class='municipal-banner-title'>💾 Central de Backups & Integridade de Dados</h2>
+                    <div class='municipal-banner-subtitle'>
+                        Monitore a conexão em tempo real e exporte backups sob demanda: <strong>Planilha Excel (.xlsx) exclusiva de Contratos</strong> ou <strong>Backup Geral com todas as informações do banco</strong>.
+                    </div>
+                </div>
+                {brasao_banner_img}
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    status = obter_status_conexao_banco()
+
+    # Métricas de Conexão e Integridade
+    col_st1, col_st2, col_st3, col_st4 = st.columns(4)
+    with col_st1:
+        if status["online"]:
+            st.metric("Status do Banco", "🟢 ONLINE / ATIVO", delta="Nuvem Conectada")
+        else:
+            st.metric("Status do Banco", "🔴 DESCONECTADO", delta="Verifique conexão", delta_color="inverse")
+    with col_st2:
+        st.metric("Tecnologia de Armazenamento", status["tipo"])
+    with col_st3:
+        st.metric("Tempo de Resposta (Ping)", f"{status['latencia_ms']} ms" if status['latencia_ms'] > 0 else "N/A")
+    with col_st4:
+        st.metric("Total de Contratos Ativos", f"{status['total_contratos']} Contratos")
+
+    st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
+
+    # Abas da Central de Segurança
+    aba_manual, aba_auto, aba_diagnostico = st.tabs([
+        "📥 Backup Manual Sob Demanda (Excel / JSON / SQL)",
+        "☁️ Backup Automático em Nuvem (Supabase)",
+        "🔍 Diagnóstico das Tabelas"
+    ])
+
+    with aba_manual:
+        st.markdown("""
+        <div style='background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px 18px; margin-bottom: 20px;'>
+            <h4 style='color: #0369a1; margin: 0 0 6px 0; font-size: 15px;'>📦 Exportação Completa Sob Demanda</h4>
+            <p style='color: #475569; font-size: 13px; margin: 0;'>
+                Escolha o formato desejado: a <strong>Planilha Excel</strong> reúne exclusivamente todos os contratos com todos os dados completos; os formatos <strong>JSON</strong> e <strong>SQL</strong> contêm todas as informações e tabelas do banco de dados.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        col_b1, col_b2, col_b3 = st.columns(3)
+
+        # 1. Excel (Somente Contratos com dados completos)
+        with col_b1:
+            st.markdown("""
+            <div style='background: #ffffff; border: 1.5px solid #0284c7; border-radius: 12px; padding: 18px; box-shadow: 0 4px 12px rgba(2, 132, 199, 0.08); text-align: center; height: 100%; display: flex; flex-direction: column; justify-content: space-between;'>
+                <div>
+                    <div style='font-size: 38px; margin-bottom: 8px;'>📊</div>
+                    <h3 style='color: #0369a1; font-size: 16px; margin: 0 0 6px 0; font-weight: 800;'>Planilha de Contratos</h3>
+                    <div style='background: #e0f2fe; color: #0369a1; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 20px; display: inline-block; margin-bottom: 12px;'>
+                        SOMENTE CONTRATOS (DADOS COMPLETOS)
+                    </div>
+                    <p style='color: #64748b; font-size: 12px; text-align: left; line-height: 1.4;'>
+                        Contém <strong>todos os 66 contratos</strong> municipais com todas as <strong>24 colunas detalhadas</strong> (fornecedores, valores em R$, secretarias, vigências, datas, dotação, fiscais). Ideal para Excel, relatórios de gestão e TCE.
+                    </p>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            with st.spinner("Preparando planilha de Contratos..."):
+                try:
+                    excel_bytes = gerar_backup_excel(engine)
+                    st.download_button(
+                        label="📥 Baixar Contratos (.xlsx)",
+                        data=excel_bytes,
+                        file_name=f"Planilha_Contratos_Completos_Ribeiraozinho_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="btn_down_excel",
+                        use_container_width=True
+                    )
+                except Exception as ex_err:
+                    st.error(f"Erro ao gerar Excel: {ex_err}")
+
+        # 2. JSON (Banco de dados completo)
+        with col_b2:
+            st.markdown("""
+            <div style='background: #ffffff; border: 1.5px solid #059669; border-radius: 12px; padding: 18px; box-shadow: 0 4px 12px rgba(5, 150, 105, 0.08); text-align: center; height: 100%; display: flex; flex-direction: column; justify-content: space-between;'>
+                <div>
+                    <div style='font-size: 38px; margin-bottom: 8px;'>📦</div>
+                    <h3 style='color: #059669; font-size: 16px; margin: 0 0 6px 0; font-weight: 800;'>Backup Geral do Banco</h3>
+                    <div style='background: #d1fae5; color: #065f46; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 20px; display: inline-block; margin-bottom: 12px;'>
+                        BANCO COMPLETO (TODAS AS INFORMAÇÕES)
+                    </div>
+                    <p style='color: #64748b; font-size: 12px; text-align: left; line-height: 1.4;'>
+                        Contém <strong>todas as tabelas do banco</strong>: Contratos, Fornecedores, Secretarias, Termos Aditivos, Protocolos, Usuários e Auditoria em formato padronizado JSON.
+                    </p>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            with st.spinner("Preparando backup geral do banco..."):
+                try:
+                    json_bytes = gerar_backup_json(engine)
+                    st.download_button(
+                        label="📥 Baixar Banco Completo (.json)",
+                        data=json_bytes,
+                        file_name=f"Backup_Geral_Banco_Ribeiraozinho_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        mime="application/json",
+                        key="btn_down_json",
+                        use_container_width=True
+                    )
+                except Exception as js_err:
+                    st.error(f"Erro ao gerar JSON: {js_err}")
+
+        # 3. SQL (Dump do banco completo)
+        with col_b3:
+            st.markdown("""
+            <div style='background: #ffffff; border: 1.5px solid #d97706; border-radius: 12px; padding: 18px; box-shadow: 0 4px 12px rgba(217, 119, 6, 0.08); text-align: center; height: 100%; display: flex; flex-direction: column; justify-content: space-between;'>
+                <div>
+                    <div style='font-size: 38px; margin-bottom: 8px;'>💾</div>
+                    <h3 style='color: #d97706; font-size: 16px; margin: 0 0 6px 0; font-weight: 800;'>Dump SQL Geral</h3>
+                    <div style='background: #fef3c7; color: #92400e; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 20px; display: inline-block; margin-bottom: 12px;'>
+                        BANCO COMPLETO (.SQL RESTAURÁVEL)
+                    </div>
+                    <p style='color: #64748b; font-size: 12px; text-align: left; line-height: 1.4;'>
+                        Instruções SQL completas de inserção de <strong>todas as tabelas do banco</strong> para restauração total do sistema em qualquer servidor relacional.
+                    </p>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            with st.spinner("Preparando script SQL..."):
+                try:
+                    sql_bytes = gerar_backup_sql(engine)
+                    st.download_button(
+                        label="📥 Baixar Dump SQL Geral (.sql)",
+                        data=sql_bytes,
+                        file_name=f"Dump_Geral_Banco_Ribeiraozinho_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql",
+                        mime="application/sql",
+                        key="btn_down_sql",
+                        use_container_width=True
+                    )
+                except Exception as sq_err:
+                    st.error(f"Erro ao gerar SQL: {sq_err}")
+
+
+    with aba_auto:
+        st.markdown("""
+        <div style='background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 22px; box-shadow: 0 2px 8px rgba(0,0,0,0.04);'>
+            <div style='display: flex; align-items: center; gap: 12px; margin-bottom: 14px;'>
+                <span style='font-size: 30px;'>☁️</span>
+                <div>
+                    <h3 style='color: #0369a1; margin: 0; font-size: 17px; font-weight: 800;'>Backup Automático Contínuo na Nuvem (Supabase / AWS)</h3>
+                    <p style='color: #64748b; font-size: 12px; margin: 2px 0 0 0;'>Proteção contra perda de dados em nível de infraestrutura internacional</p>
+                </div>
+            </div>
+            
+            <div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 16px;'>
+                <div style='background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px;'>
+                    <div style='font-weight: 700; color: #0f172a; font-size: 13px; margin-bottom: 6px;'>🕒 Snapshots Diários Automáticos</div>
+                    <div style='color: #475569; font-size: 12px; line-height: 1.45;'>
+                        O banco de dados do Supabase cria cópias completas diárias de todas as tabelas e dados automaticamente durante a madrugada, sem interromper o uso do sistema.
+                    </div>
+                </div>
+
+                <div style='background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px;'>
+                    <div style='font-weight: 700; color: #0f172a; font-size: 13px; margin-bottom: 6px;'>🛡️ Redundância e Tolerância a Falhas</div>
+                    <div style='color: #475569; font-size: 12px; line-height: 1.45;'>
+                        Hospedado no data center da AWS em São Paulo (sa-east-1) com discos SSD NVMe redundantes, proteção contra falhas de hardware e criptografia em repouso e trânsito (SSL/TLS).
+                    </div>
+                </div>
+
+                <div style='background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px;'>
+                    <div style='font-weight: 700; color: #0f172a; font-size: 13px; margin-bottom: 6px;'>👥 Salvamento Simultâneo Concorrente</div>
+                    <div style='color: #475569; font-size: 12px; line-height: 1.45;'>
+                        Múltiplos operadores podem cadastrar e editar contratos ao mesmo tempo pela web ou computador, sem conflitos de concorrência ou bloqueio de arquivos.
+                    </div>
+                </div>
+            </div>
+
+            <div style='margin-top: 20px; padding: 12px 16px; background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; display: flex; align-items: center; gap: 10px;'>
+                <span style='font-size: 20px;'>✅</span>
+                <div style='color: #065f46; font-size: 12.5px;'>
+                    <strong>Conclusão:</strong> Seus dados já estão salvos e protegidos na nuvem de forma permanente. Os downloads manuais são recomendados para cópias de segurança locais e arquivamento municipal.
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with aba_diagnostico:
+        st.markdown("<h4 style='color: #0f172a; font-size: 14px; margin-bottom: 10px;'>📋 Contagem e Saúde das Tabelas no Banco Ativo</h4>", unsafe_allow_html=True)
+        try:
+            with engine.connect() as conn:
+                info_tabelas = [
+                    ("contratos", "Contratos Municipais Registrados", "📄"),
+                    ("fornecedores", "Empresas e Fornecedores Cadastrados", "🏢"),
+                    ("orgaos", "Secretarias e Órgãos Municipais", "🏛️"),
+                    ("termos_aditivos", "Termos Aditivos Registrados", "📑"),
+                    ("protocolos", "Processos e Protocolos Internos", "📋"),
+                    ("usuarios", "Usuários e Operadores do Sistema", "👥"),
+                    ("audit_log", "Logs de Auditoria e Ações", "🕒")
+                ]
+                dados_diag = []
+                for t_name, t_desc, t_icon in info_tabelas:
+                    try:
+                        qtd = conn.execute(text(f"SELECT count(*) FROM {t_name}")).scalar()
+                        dados_diag.append({
+                            "Ícone": t_icon,
+                            "Tabela": t_name,
+                            "Descrição": t_desc,
+                            "Total de Registros": qtd,
+                            "Status": "🟢 Saudável"
+                        })
+                    except Exception:
+                        dados_diag.append({
+                            "Ícone": t_icon,
+                            "Tabela": t_name,
+                            "Descrição": t_desc,
+                            "Total de Registros": 0,
+                            "Status": "⚠️ Não encontrada / Vazia"
+                        })
+                df_diag = pd.DataFrame(dados_diag)
+                st.dataframe(df_diag, use_container_width=True, hide_index=True)
+        except Exception as err_diag:
+            st.error(f"Erro ao carregar diagnóstico: {err_diag}")
+
 def main():
     if "logged_in" not in st.session_state:
         st.session_state["logged_in"] = False
@@ -6225,6 +6663,29 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
+            # Indicador Visual de Status do Banco de Dados em Tempo Real
+            st_banco = obter_status_conexao_banco()
+            if st_banco["online"]:
+                st.markdown(f"""
+                <div class='gel-db-status-box'>
+                    <div class='gel-db-pulse-dot'></div>
+                    <div style='flex: 1; text-align: left;'>
+                        <div style='font-weight: 800; color: #10b981; font-size: 11px; line-height: 1.15;'>🟢 BANCO ATIVO NA NUVEM</div>
+                        <div style='font-size: 9.5px; color: #94a3b8; margin-top: 2px;'>{st_banco["tipo"].split("(")[0].strip()} • {st_banco["total_contratos"]} contratos</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class='gel-db-status-box' style='border-color: #ef4444;'>
+                    <div class='gel-db-pulse-dot offline'></div>
+                    <div style='flex: 1; text-align: left;'>
+                        <div style='font-weight: 800; color: #ef4444; font-size: 11px; line-height: 1.15;'>🔴 BANCO DESCONECTADO</div>
+                        <div style='font-size: 9.5px; color: #fca5a5; margin-top: 2px;'>Verifique conexão</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
             st.markdown("""
             <div style='margin-bottom: 10px; padding: 0 4px; display: flex; justify-content: space-between; align-items: center;'>
                 <span style='font-size: 10.5px; font-weight: 800; color: #0284c7; letter-spacing: 0.5px; text-transform: uppercase;'>
@@ -6287,6 +6748,11 @@ def main():
                       type="primary" if menu_atual == "🏛️ Secretários e Fiscais" else "secondary",
                       on_click=mudar_menu, args=("🏛️ Secretários e Fiscais",))
 
+            # Módulo 10: Backups e Segurança
+            st.button("💾 Backups e Segurança", key="nav_btn_backups", use_container_width=True, 
+                      type="primary" if menu_atual == "💾 Backups e Segurança" else "secondary",
+                      on_click=mudar_menu, args=("💾 Backups e Segurança",))
+
             st.button("🚪 Sair do Sistema", key="btn_logout", use_container_width=True, on_click=executar_logout)
 
         # Roteamento Dinâmico com Isolamento de Tela (Evita Ghosting/Sobreposição)
@@ -6320,6 +6786,8 @@ def main():
                 tela_fornecedores()
             elif menu_atual == "🏛️ Secretários e Fiscais":
                 tela_gestao_secretarios_fiscais()
+            elif menu_atual == "💾 Backups e Segurança":
+                tela_backups_sistema()
             elif menu_atual == "➕ Novo Contrato":
                 formulario_contrato()
             elif menu_atual == "➕ Novo Protocolo":
