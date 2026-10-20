@@ -23,7 +23,8 @@ from decimal import Decimal
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, event
+from sqlalchemy.pool import NullPool
 import plotly.express as px
 import plotly.graph_objects as go
 import bcrypt
@@ -1136,6 +1137,123 @@ def obter_brasao_b64():
             return base64.b64encode(f.read()).decode("utf-8")
     return ""
 
+
+def obter_caminho_sqlite_gravavel(caminho_original: str) -> str:
+    """
+    Verifica se o arquivo e a pasta do SQLite são graváveis.
+    Em ambientes como Streamlit Cloud (Linux /mount/src) ou pastas do OneDrive bloqueadas,
+    redireciona transparentemente para um diretório temporário gravável.
+    """
+    try:
+        caminho_abs = os.path.abspath(caminho_original)
+        dir_pai = os.path.dirname(caminho_abs)
+        pasta_gravavel = False
+        if os.path.exists(dir_pai):
+            try:
+                teste_path = os.path.join(dir_pai, f".write_test_{os.getpid()}")
+                with open(teste_path, "w") as f:
+                    f.write("ok")
+                if os.path.exists(teste_path):
+                    os.remove(teste_path)
+                pasta_gravavel = True
+            except Exception:
+                pasta_gravavel = False
+
+        if pasta_gravavel:
+            return caminho_abs
+
+        import tempfile, shutil
+        temp_dir = tempfile.gettempdir()
+        caminho_temp = os.path.join(temp_dir, os.path.basename(caminho_original))
+        if os.path.exists(caminho_abs) and not os.path.exists(caminho_temp):
+            try:
+                shutil.copy2(caminho_abs, caminho_temp)
+            except Exception:
+                pass
+        if os.path.exists(caminho_temp):
+            return caminho_temp
+        return caminho_abs
+    except Exception:
+        return caminho_original
+
+def garantir_permissoes_sqlite(caminho_db: str):
+    """Garante que o arquivo SQLite e seu diretório tenham permissão de leitura/gravação."""
+    try:
+        import stat
+        caminho_abs = os.path.abspath(caminho_db)
+        dir_banco = os.path.dirname(caminho_abs)
+        if os.path.exists(dir_banco):
+            modo_dir = os.stat(dir_banco).st_mode
+            os.chmod(dir_banco, modo_dir | stat.S_IWRITE | stat.S_IREAD)
+        if os.path.exists(caminho_abs):
+            modo_arq = os.stat(caminho_abs).st_mode
+            os.chmod(caminho_abs, modo_arq | stat.S_IWRITE | stat.S_IREAD)
+    except Exception:
+        pass
+
+def criar_engine_sqlite(sqlite_path: str):
+    """Cria uma engine SQLite ultra-resiliente com NullPool, WAL mode e timeout estendido."""
+    caminho_efetivo = obter_caminho_sqlite_gravavel(sqlite_path)
+    garantir_permissoes_sqlite(caminho_efetivo)
+    abs_path = os.path.abspath(caminho_efetivo).replace("\\", "/")
+    eng = create_engine(
+        f"sqlite:///{abs_path}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+        poolclass=NullPool
+    )
+    @event.listens_for(eng, "connect")
+    def _configurar_sqlite_pragmas(dbapi_connection, connection_record):
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA busy_timeout = 30000;")
+            try:
+                cursor.execute("PRAGMA journal_mode = WAL;")
+            except Exception:
+                try:
+                    cursor.execute("PRAGMA journal_mode = DELETE;")
+                except Exception:
+                    pass
+            cursor.execute("PRAGMA synchronous = NORMAL;")
+            cursor.close()
+        except Exception:
+            pass
+    return eng
+
+def executar_transacao_resiliente(operacao_fn):
+    """
+    Executa uma operação no banco de forma resiliente.
+    Se falhar com erro de readonly (Streamlit Cloud ou OneDrive), redireciona
+    automaticamente para uma cópia gravável no diretório temporário do sistema.
+    """
+    eng = get_engine()
+    try:
+        with eng.connect() as conn:
+            res = operacao_fn(conn)
+            conn.commit()
+            return res
+    except Exception as err:
+        err_str = str(err).lower()
+        if "readonly" in err_str or "locked" in err_str:
+            try:
+                import tempfile, shutil
+                caminho_orig = DB_CONFIG.get("sqlite_path", "gestao_contratos.db")
+                caminho_abs = os.path.abspath(caminho_orig)
+                temp_db = os.path.join(tempfile.gettempdir(), os.path.basename(caminho_orig))
+                if os.path.exists(caminho_abs) and not os.path.exists(temp_db):
+                    shutil.copy2(caminho_abs, temp_db)
+                DB_CONFIG["sqlite_path"] = temp_db
+                try:
+                    get_engine.clear()
+                except Exception:
+                    pass
+                with get_engine().connect() as retry_conn:
+                    res = operacao_fn(retry_conn)
+                    retry_conn.commit()
+                    return res
+            except Exception as retry_err:
+                raise retry_err
+        raise err
+
 # Conexão com o Banco de Dados
 @st.cache_resource
 def get_engine():
@@ -1202,7 +1320,7 @@ def get_engine():
     db_type = DB_CONFIG.get("type", "sqlite")
     if db_type == "sqlite":
         sqlite_path = DB_CONFIG.get("sqlite_path", "gestao_contratos.db")
-        return create_engine(f"sqlite:///{sqlite_path}", connect_args={'check_same_thread': False})
+        return criar_engine_sqlite(sqlite_path)
     else:
         try:
             eng = create_engine(
@@ -1213,7 +1331,7 @@ def get_engine():
             return eng
         except Exception:
             sqlite_path = DB_CONFIG.get("sqlite_path", "gestao_contratos.db")
-            return create_engine(f"sqlite:///{sqlite_path}", connect_args={'check_same_thread': False})
+            return criar_engine_sqlite(sqlite_path)
 
 engine = get_engine()
 
@@ -2019,7 +2137,7 @@ def alterar_propria_senha(usuario_id: int, senha_atual: str, nova_senha: str, co
     senha_hash = bcrypt.hashpw(nova_limpa.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     
     try:
-        with engine.connect() as conn:
+        with get_engine().connect() as conn:
             conn.execute(
                 text("UPDATE usuarios SET senha_hash = :sh WHERE id = :id"),
                 {"sh": senha_hash, "id": int(usuario_id)}
@@ -2048,7 +2166,7 @@ def redefinir_senha_usuario_admin(usuario_id: int, nova_senha: str, confirmar_se
     senha_hash = bcrypt.hashpw(nova_limpa.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
     
     try:
-        with engine.connect() as conn:
+        with get_engine().connect() as conn:
             adm = conn.execute(text("SELECT cargo, nome FROM usuarios WHERE id = :id AND ativo = 1"), {"id": admin_id}).mappings().first()
             if not adm or adm["cargo"] not in ["ADMIN", "ADMINISTRADOR"]:
                 return False, "Apenas administradores podem redefinir a senha de outros usuários."
@@ -2079,7 +2197,7 @@ def alternar_status_usuario(usuario_id: int, current_user_id: int) -> tuple[bool
     if usuario_id == current_user_id:
         return False, "Não é permitido inativar o seu próprio usuário logado."
     try:
-        with engine.connect() as conn:
+        with get_engine().connect() as conn:
             u = conn.execute(text("SELECT id, nome, cargo, ativo FROM usuarios WHERE id = :id"), {"id": usuario_id}).mappings().first()
             if not u:
                 return False, "Usuário não encontrado."
@@ -2113,7 +2231,7 @@ def alternar_status_usuario(usuario_id: int, current_user_id: int) -> tuple[bool
 def carregar_auditoria_usuarios(limit: int = 50) -> pd.DataFrame:
     """Carrega os registros mais recentes de auditoria relacionados a usuários e senhas."""
     try:
-        with engine.connect() as conn:
+        with get_engine().connect() as conn:
             query = text("""
                 SELECT data_hora, acao, usuario_nome, descricao
                 FROM audit_log
@@ -2128,7 +2246,7 @@ def carregar_auditoria_usuarios(limit: int = 50) -> pd.DataFrame:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def carregar_usuarios():
-    with engine.connect() as conn:
+    with get_engine().connect() as conn:
         query = text("SELECT id, nome, email, cargo, ativo, data_criacao FROM usuarios ORDER BY nome ASC")
         return pd.read_sql(query, conn)
 
@@ -2159,35 +2277,45 @@ def cadastrar_novo_usuario(nome, usuario_login=None, senha="", cargo="OPERADOR")
     senha_limpa = senha.strip()
     senha_hash = bcrypt.hashpw(senha_limpa.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
-    with engine.connect() as conn:
+    def _operacao_cadastro(conn):
         existe = conn.execute(
-            text("SELECT id FROM usuarios WHERE LOWER(nome) = LOWER(:n) OR LOWER(email) = LOWER(:e)"),
+            text("SELECT id, nome, cargo FROM usuarios WHERE LOWER(nome) = LOWER(:n) OR LOWER(email) = LOWER(:e)"),
             {"n": nome_limpo, "e": login_limpo}
-        ).fetchone()
+        ).mappings().first()
         if existe:
-            return False, f"Já existe um usuário cadastrado com este Nome ('{nome_limpo}') ou Login ('{login_limpo}')."
-
-        try:
-            res = conn.execute(
-                text("""
-                    INSERT INTO usuarios (nome, email, senha_hash, cargo, ativo, data_criacao)
-                    VALUES (:nome, :email, :senha, :cargo, 1, CURRENT_TIMESTAMP)
-                """),
-                {"nome": nome_limpo, "email": login_limpo, "senha": senha_hash, "cargo": cargo}
+            conn.execute(
+                text("UPDATE usuarios SET senha_hash = :senha, cargo = :cargo, ativo = 1 WHERE id = :id"),
+                {"senha": senha_hash, "cargo": cargo, "id": existe["id"]}
             )
-            novo_id = res.lastrowid
             registrar_audit_log(
-                conn, "usuarios", novo_id, "CADASTRO_USUARIO",
-                f"Novo usuário '{nome_limpo}' cadastrado com perfil '{cargo}' e login '{login_limpo}'."
+                conn, "usuarios", existe["id"], "ATUALIZACAO_SENHA_CADASTRO",
+                f"Usuário '{nome_limpo}' já existente teve sua senha e perfil atualizados para '{cargo}'."
             )
-            conn.commit()
-            try:
-                carregar_usuarios.clear()
-            except Exception:
-                pass
-            return True, f"Servidor '{nome_limpo}' cadastrado com sucesso! Login de acesso: '{login_limpo}'."
-        except Exception as err:
-            return False, f"Erro ao gravar usuário: {str(err)}"
+            return True, f"Servidor '{nome_limpo}' já existia e teve sua senha atualizada com sucesso! Login: '{login_limpo}'."
+
+        res = conn.execute(
+            text("""
+                INSERT INTO usuarios (nome, email, senha_hash, cargo, ativo, data_criacao)
+                VALUES (:nome, :email, :senha, :cargo, 1, CURRENT_TIMESTAMP)
+            """),
+            {"nome": nome_limpo, "email": login_limpo, "senha": senha_hash, "cargo": cargo}
+        )
+        novo_id = res.lastrowid
+        registrar_audit_log(
+            conn, "usuarios", novo_id, "CADASTRO_USUARIO",
+            f"Novo usuário '{nome_limpo}' cadastrado com perfil '{cargo}' e login '{login_limpo}'."
+        )
+        return True, f"Servidor '{nome_limpo}' cadastrado com sucesso! Login de acesso: '{login_limpo}'."
+
+    try:
+        ok, msg = executar_transacao_resiliente(_operacao_cadastro)
+        try:
+            carregar_usuarios.clear()
+        except Exception:
+            pass
+        return ok, msg
+    except Exception as err:
+        return False, f"Erro ao gravar usuário: {str(err)}"
 
 def atualizar_usuario(usuario_id, nome, usuario_login, cargo, ativo, nova_senha=None):
     if not nome or not str(nome).strip():
@@ -2208,7 +2336,7 @@ def atualizar_usuario(usuario_id, nome, usuario_login, cargo, ativo, nova_senha=
     else:
         senha_limpa = None
 
-    with engine.connect() as conn:
+    with get_engine().connect() as conn:
         conflito = conn.execute(
             text("SELECT id FROM usuarios WHERE LOWER(email) = LOWER(:e) AND id != :id"),
             {"e": login_limpo, "id": usuario_id}
@@ -2257,7 +2385,7 @@ def atualizar_usuario(usuario_id, nome, usuario_login, cargo, ativo, nova_senha=
 def excluir_usuario(usuario_id, current_user_id):
     if usuario_id == current_user_id:
         return False, "Você não pode excluir o seu próprio usuário logado."
-    with engine.connect() as conn:
+    with get_engine().connect() as conn:
         u = conn.execute(text("SELECT id, nome, cargo FROM usuarios WHERE id = :id"), {"id": usuario_id}).mappings().first()
         if not u:
             return False, "Usuário não localizado no banco."
